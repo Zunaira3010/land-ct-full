@@ -1,8 +1,8 @@
 # 03 — Verified Spec: Paper + Official Repo Cross-Check
 
 *Single source of truth for exact fidelity (Decision 0002). Every line here is traced to either
-the paper text or the official repo's README — nothing here is inferred or assumed. Anything
-still unconfirmed is listed explicitly at the bottom, not silently filled in.*
+the paper text or the official repo's README/source — nothing here is inferred or assumed.
+Anything still unconfirmed is listed explicitly at the bottom, not silently filled in.*
 
 ## Architecture — confirmed, paper and repo agree
 
@@ -51,13 +51,18 @@ it isn't a separate, smaller run than the paper describes.
 - Training: LIDC-IDRI only, 1,010 volumes, both VAEs + U-Net.
 - NLST: inference/eval only, never training. 881 volumes with nodule annotations used for FID/MMD.
 - Preprocessing: HU-clip [−1000, 0.01 upper percentile] → resample 1mm isotropic → center-crop
-  256³ → normalize [0,1].
-- **Precomputed masks available from the authors for both LIDC and NLST** (Decision 0005) — only
-  real CT `.npy` volumes need generating locally via `scripts/preproc_data.sh`.
+  256³ → normalize [0,1] (paper's prose reading — see the corrected normalization entry below for
+  what the code actually does).
+- **Masks are extracted independently, not downloaded precomputed** (Decision 0007, supersedes
+  the original Decision 0005 plan) — the authors' precomputed mask package is gated behind
+  Eurecat's SharePoint tenant. `preprocessing.py` generates both CT `.npy` volumes and mask
+  `.npy` files in the same pass, via `pylidc.consensus()` (nodule annotations) and `lungmask`'s
+  `LMInferer` (lung segmentation) — the same tools the paper itself cites, not a downstream
+  artifact of them.
 
 ## Pipeline stage order — confirmed (repo README, matches BRAIN's existing phase plan)
 
-1. `preproc_data.sh` → DICOMs to `.npy` CT + masks
+1. `preproc_data.sh` → DICOMs to `.npy` CT + masks (both generated locally, see above)
 2. `train_vae.sh` → image VAE
 3. `train_vae_masks.sh` → mask VAE (needs `MASK_MODE=nodule+lung` for our target config)
 4. `train_ldm.sh` → U-Net, loads both frozen VAE checkpoints (`vae_dir`, `vae_mask_dir`)
@@ -99,3 +104,16 @@ configuration used to produce the paper's results), not the paper's prose, per D
   (`normalize_ct_vol_wdm`) clips at the running volume's 99.9th percentile and does per-volume
   min-max, not a fixed range. The fixed-range function (`normalize_ct_vol`) exists in the repo
   but is dead code — never called by the pipeline. Use `normalize_ct_vol_wdm`.
+- **Nodule texture values**: `preprocess_dicom()` stores each nodule's texture as the mean of all
+  contributing radiologists' scores (can be non-integer, e.g. 2.33), not a clean 1–5. Separately,
+  `LIDCMasks.__getitem__` randomly reassigns each nodule's texture label 1–5 by default
+  (`original_textures=False`) when `mask_mode="nodule+lung+texture"` — irrelevant to our current
+  `nodule+lung` (T=3) target, since that mode has no texture channel, but relevant if/when the
+  T=7 variant is attempted later; pass `--original_textures` to preserve real annotated scores.
+
+## Still unconfirmed — do not assume
+
+- Whether patch-based training is needed for the mask VAE (256³ full-volume, per
+  `config_vae_masks_train.json`) on the RTX 2080 Ti's 11GB, or whether it fits as-is like the
+  paper's own A100 run — test empirically via the Phase 5 smoke test before committing to the
+  full 150-epoch run.
