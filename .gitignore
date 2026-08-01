@@ -5,3 +5,7 @@ reference_official_repo/
 *.pyc
 __pycache__/
 .ipynb_checkpoints/
+
+logs/
+
+data/processed_smoke/
