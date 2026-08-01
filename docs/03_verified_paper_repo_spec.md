@@ -9,7 +9,7 @@ still unconfirmed is listed explicitly at the bottom, not silently filled in.*
 | Component | Spec |
 |---|---|
 | Image VAE | 3 resolution levels, 1 residual block/level, balanced encoder/decoder channel widths (not doubled in decoder like base MAISI). Loss: MAE + LPIPS + adversarial (discriminator C) + KL. |
-| Mask VAE | Same architecture family as image VAE, different input channels (one-hot). Loss: WCE + GDL + KL (β=1e-7). Class weights: α_nodule=10, α_lung=1, α_other=0.1. |
+| Mask VAE | Same architecture family as image VAE, different input channels (one-hot). Loss: WCE + GDL + KL (β=1e-7). Class weights **as stated in the paper text**: α_nodule=10, α_lung=1, α_other=0.1 — but see the correction below, the actual training code uses a different background weight. |
 | U-Net | 5 resolution levels, 2 residual blocks/level, **additive skips** (not concat), cross-attention at every level. v-prediction target. Linear noise schedule β₁=1e-4→β_T=0.02, T=1000. Min-SNR-γ loss, γ=5.0 (confirmed against repo in earlier session). |
 | Latent shape | Image: 4 × 64×64×64 for a 256³ input (4x downsampling per axis). |
 
@@ -29,7 +29,7 @@ Mask value convention (paper): lung = 0.5, nodule = 1 (uniform) or 1–5 (textur
 |---|---|---|
 | Image VAE epochs | 100 | Paper |
 | Image VAE LR | 1e-4 (AdamW) | Paper |
-| Mask VAE training | same procedure as image VAE | Paper |
+| Mask VAE training | paper says "same procedure" (100 epochs); **code actually uses 150** | Paper text vs. `config_vae_masks_train.json` — see corrections below |
 | U-Net training | 500,000 **optimization steps** (not epochs) | Paper |
 | U-Net LR | 1e-5 (AdamW) | Paper |
 | Batch size (all 3 networks) | 1 | Paper + repo (`bsz` example = 1) |
@@ -38,15 +38,13 @@ Mask value convention (paper): lung = 0.5, nodule = 1 (uniform) or 1–5 (textur
 | Resolution | 256³, 1mm isotropic | Paper + repo |
 | `--attention` flag | used in **all** experiments in the paper | Repo README |
 
-## ⚠️ One nuance to resolve before writing the training script — NOT yet reconciled
+## Resolved — epochs vs. steps for the U-Net
 
-The repo's `train_ldm.sh` config table lists `num_epochs` (example value: 500) as the controlling
-parameter, but the **paper reports 500,000 steps**, not 500 epochs. These aren't necessarily
-contradictory (500 epochs over N samples could equal ~500k steps depending on dataset size and
-batch size), but **don't assume they reconcile — compute it explicitly** once the real dataset
-size is known: `steps = epochs × (num_samples / batch_size)`. If the numbers don't line up, trust
-the paper's explicit step count (500,000) as the fidelity target, since Decision 0002 treats the
-paper text as the primary source and the repo as an implementation reference.
+`train_ldm.sh`'s actual `num_epochs=500` (not just an example value, confirmed by reading the
+script directly). With all 1,010 LIDC-IDRI patients and `bsz=1`, that's 500 × 1,010 ≈ 505,000
+optimizer steps — matching the paper's reported 500,000 steps closely enough (~1% over) to
+confirm these reconcile rather than conflict. Treat `num_epochs=500` as the operational target;
+it isn't a separate, smaller run than the paper describes.
 
 ## Data — confirmed
 
@@ -70,12 +68,34 @@ paper text as the primary source and the repo as an implementation reference.
 Code: Apache 2.0. Paper: CC BY-NC-ND 4.0. No conflict with building, referencing, or eventually
 citing this work in a publication.
 
-## Still unconfirmed — do not assume, verify when the actual config files are reachable
+## Resolved — read directly from `reference_official_repo/src/vae/configs/*.json`
 
-- `LATENT_SIZE` parameter for the mask VAE (repo table shows example value `1`, described only as
-  "latent bottleneck size" — not explained further in the README or paper text). Check the actual
-  `src/vae/configs/` JSON once cloned locally, don't guess what this controls.
-- Exact channel widths/counts for the "balanced" VAE configuration (paper says "balanced" and
-  "lightweight," doesn't give literal channel numbers) — read from `config_vae.json` directly.
-- Whether `num_epochs` and the paper's 500k-step figure actually reconcile for the full
-  1,010-patient dataset (see nuance above) — compute once dataset size is finalized.
+- **`LATENT_SIZE`** = `latent_channels` in the mask-VAE config. `config_vae_masks_nodule+lung_latent1.json`
+  (our target `nodule+lung` mode) confirms `latent_channels: 1` — so `LATENT_SIZE=1` means a
+  1-channel latent bottleneck, not an ambiguous "size" knob.
+- **Image VAE channel widths** (`config_vae.json`): `num_channels: [32, 64, 128]`, 1 residual
+  block per level, `norm_num_groups: 32`, `latent_channels: 4` — matches the paper's "4-channel
+  latent" and "3 resolution levels, 1 block each."
+- **Mask VAE channel widths** (`config_vae_masks.json` / `config_vae_masks_nodule+lung_latent1.json`):
+  `num_channels: [16, 32, 64]`, `norm_num_groups: 16` — narrower than the image VAE, consistent
+  with masks carrying less information than raw CT intensity.
+
+## Corrections — paper text vs. actual training code (verified by reading both directly)
+
+These are genuine paper/code discrepancies, not our own deviations — logged as Decisions
+0008–0011 in the memory pack. Our implementation follows the **code** (the actual training
+configuration used to produce the paper's results), not the paper's prose, per Decision 0002.
+
+- **Mask VAE epochs**: paper says "same procedure as the image VAE" (100 epochs, implying the
+  same). `config_vae_masks_train.json` sets `n_epochs: 150`. Use 150.
+- **Mask VAE background class weight**: paper text states α_other=0.1. `vae/utils/masks_utils.py`'s
+  `vae_loss_segmentation` hardcodes `class_weights = [0.5, 10.0, 1.0]` for the 3-class
+  (`nodule+lung`) case — background weight is **0.5**, not 0.1. Use 0.5.
+- **Image VAE patch training**: not stated in the paper's main text at all (only visible in
+  `config_vae_train.json`'s `patch_size: [128, 128, 128]`). This is the authors' own training
+  setup on their A100, not a compromise specific to our smaller GPU — no deviation to log here,
+  just something the paper omits and the code reveals.
+- **HU normalization**: paper's prose implies a fixed clip range; the actual function used
+  (`normalize_ct_vol_wdm`) clips at the running volume's 99.9th percentile and does per-volume
+  min-max, not a fixed range. The fixed-range function (`normalize_ct_vol`) exists in the repo
+  but is dead code — never called by the pipeline. Use `normalize_ct_vol_wdm`.

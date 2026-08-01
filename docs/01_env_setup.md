@@ -63,8 +63,10 @@ git config --local --list
 
 ## Confirmed (July 25, 2026)
 
-- **Disk:** ~500GB free, not yet precisely checked. Deliberately not blocking setup on this —
-  revisit exact numbers at the dataset-download milestone, not before.
+- **Disk:** ~500GB free at initial setup, precisely unchecked at the time. **Updated July 27,
+  2026:** confirmed via `Get-PSDrive` — C: has 851GB free of 930GB. Full pipeline footprint is
+  ~260GB (raw DICOM ~125GB + processed `.npy` for all 1,010 patients ~130–135GB), comfortably
+  covered; no need to relocate to another drive.
 - **Sharing:** **Same Windows user account** as one teammate, working on a **LungDDPM** paper
   implementation — corrected from an earlier assumption of "separate accounts, shared PC" (see
   Decision 0004). This is a bigger deal than just a shared machine:
@@ -86,13 +88,15 @@ git config --local --list
   force cutting corners on the full-paper scope. Exact checkpoint-cadence policy is a follow-up
   decision, not decided yet (flagged in BRAIN 00_INDEX open questions).
 
-## TBD — confirm on the actual machine
+## Setup checklist — all confirmed
 
 - [x] GPU: **RTX 2080 Ti, 11GB VRAM** confirmed via `nvidia-smi` (see Decision 0003) — not a
       GTX 1080 as originally assumed.
 - [x] CUDA/driver: KMD 610.62, CUDA UMD 13.3, confirmed via `nvidia-smi`.
-- [ ] Exact free disk space (rough number in hand: ~500GB; confirm precisely when the dataset
-      download milestone actually arrives).
-- [ ] Teammate's conda env / folder naming, so nothing collides on the shared machine.
-- [ ] Conda install completed and `conda activate land-ct-v2` works.
-- [ ] `torch.cuda.is_available()` returns `True` with the correct GPU name.
+- [x] Exact free disk space: 851GB free of 930GB on C:, confirmed via `Get-PSDrive`.
+- [x] Conda install completed, `conda activate land-ct-v2` confirmed working.
+- [x] `torch.cuda.is_available()` → `True`, correctly reports the RTX 2080 Ti (torch 2.6.0+cu124).
+- [x] `pylidc` + `lungmask` installed, `setuptools<81` pin applied (Bug 001, resolved).
+
+No teammate-collision issues have surfaced so far (shared-account risk noted above), but keep
+checking `~/.pylidcrc` before any run if that changes.

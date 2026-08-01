@@ -4,6 +4,12 @@
 anything that errors or looks different from expected — so this file (and BRAIN/chats/) captures
 the real state, not the assumed one.*
 
+> **Status: this step is already done.** Kept as a historical record of the setup runbook, not a
+> pending task. The GPU/hardware expectations below ("should say GTX 1080") were the *pre-setup
+> assumption* and turned out to be wrong — see `01_env_setup.md` and Decision 0003 for the actual
+> confirmed hardware (RTX 2080 Ti, 11GB VRAM) and Decision 0004 for the actual (shared, not
+> separate) account situation. Don't follow this doc expecting a GTX 1080 or a solo account.
+
 ## 1. Confirm the machine, before installing anything
 
 ```cmd
