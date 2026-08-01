@@ -21,6 +21,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 
 from monai.networks.blocks import Convolution
 from monai.networks.blocks.spatialattention import SpatialAttentionBlock
@@ -677,6 +678,7 @@ class MaisiEncoder(nn.Module):
         include_fc: bool = False,
         use_combined_linear: bool = False,
         use_flash_attention: bool = False,
+        use_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -689,6 +691,7 @@ class MaisiEncoder(nn.Module):
             raise ValueError("num_res_blocks and num_channels must have the same size")
 
         self.save_mem = save_mem
+        self.use_checkpointing = use_checkpointing
 
         blocks: list[nn.Module] = []
        
@@ -818,9 +821,12 @@ class MaisiEncoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        
+
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpointing and self.training and torch.is_grad_enabled():
+                x = torch_checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             _empty_cuda_cache(self.save_mem)
         
         return x
@@ -872,10 +878,12 @@ class MaisiDecoder(nn.Module):
         use_flash_attention: bool = False,
         use_convtranspose: bool = False,
         verbose: bool = False,
+        use_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.print_info = print_info
         self.save_mem = save_mem
+        self.use_checkpointing = use_checkpointing
 
         reversed_block_out_channels = list(reversed(num_channels))
 
@@ -1018,9 +1026,12 @@ class MaisiDecoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        
+
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpointing and self.training and torch.is_grad_enabled():
+                x = torch_checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             _empty_cuda_cache(self.save_mem)
 
         return x
@@ -1139,6 +1150,7 @@ class AutoencoderKlReducedMaisi(AutoencoderKL, ModelMixin, ConfigMixin):
             norm_float16=norm_float16,
             print_info=print_info,
             save_mem=save_mem,
+            use_checkpointing=use_checkpointing,
         )
 
         self.decoder: nn.Module = MaisiDecoder(
@@ -1160,5 +1172,6 @@ class AutoencoderKlReducedMaisi(AutoencoderKL, ModelMixin, ConfigMixin):
             norm_float16=norm_float16,
             print_info=print_info,
             save_mem=save_mem,
+            use_checkpointing=use_checkpointing,
         )
 
