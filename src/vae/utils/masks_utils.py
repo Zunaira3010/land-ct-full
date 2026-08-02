@@ -8,7 +8,8 @@ import glob
 
 class LIDCMasks(torch.utils.data.Dataset):
     def __init__(self, directory, mask_mode="none", num_classes=7, 
-                 use_onehot=False, split="train", val_ratio=0.1, seed=42, sdf_flag=False, original_textures=False, sdf_truncation=20, spacing=None):
+                 use_onehot=False, split="train", val_ratio=0.1, seed=42, sdf_flag=False, original_textures=False, sdf_truncation=20, spacing=None,
+                 patch_size=None, patch_pos_ratio=0.7):
         """
         directory: expected to contain masks as .npy
         mask_mode: controls preprocessing of the mask
@@ -16,8 +17,19 @@ class LIDCMasks(torch.utils.data.Dataset):
         use_onehot: if True -> return one-hot mask [C,D,H,W], else single-channel [1,D,H,W]
         split: "train" or "val"
         val_ratio: fraction of data used for validation
-        seed: random seed for reproducible split
         mask_part: "nodule", "lung", or "all" 
+        patch_size: [D,H,W] crop size, or None to use the full volume (256^3) as-is.
+            Hardware-forced deviation from the paper's full-volume mask VAE training --
+            see decision log. None preserves the original (pre-patch) behavior exactly.
+            ONLY APPLIED WHEN split=="train" -- see __getitem__. Validation is always
+            full-volume (256^3), uncropped, matching the paper authors' own validation
+            protocol; this argument is accepted for val instances too (so the training
+            script's call sites stay symmetric) but is a no-op there by design.
+        patch_pos_ratio: only used when split=="train" and patch_size is set. Fraction of
+            crops centered on a nodule voxel ("positive" sample) rather than a fully random
+            location. Nodules are small relative to a 256^3 volume, so plain uniform random
+            cropping risks many patches never containing one -- this counters that, the same
+            way the earlier (v1) project's patch sampling did.
         """
         super().__init__()
         self.directory = os.path.expanduser(directory)
@@ -28,6 +40,9 @@ class LIDCMasks(torch.utils.data.Dataset):
         self.sdf_truncation = sdf_truncation
         self.spacing = spacing
         self.original_textures = original_textures
+        self.patch_size = tuple(patch_size) if patch_size is not None else None
+        self.patch_pos_ratio = patch_pos_ratio
+        self.is_train = (split == "train")
 
         # collect all mask paths
         all_paths = sorted(glob.glob(self.directory + "/**/mask/*.npy", recursive=True))
@@ -53,6 +68,50 @@ class LIDCMasks(torch.utils.data.Dataset):
         self.image_paths = [all_paths[i] for i in selected_indices]
         self.n_images = len(self.image_paths)
 
+
+    def _foreground_class_ids(self):
+        """Class IDs that represent nodule presence (excludes plain lung tissue -- lung is
+        common and gets sampled by chance anyway; nodules are the rare class patch training
+        risks missing entirely)."""
+        if self.mask_mode == "nodule":
+            return [1]
+        elif self.mask_mode == "nodule+lung":
+            return [1]
+        elif self.mask_mode == "nodule+lung+texture":
+            return [1, 2, 3, 4, 5]
+        else:
+            return []
+
+    def _crop_bounds(self, mask_arr):
+        """Returns (start_d, start_h, start_w, pd, ph, pw) for cropping mask_arr to
+        self.patch_size. Train: patch_pos_ratio fraction of crops are centered on a
+        random nodule voxel (falls back to plain random if this volume has none), the
+        rest are plain random. Val: always a deterministic center crop, no randomness,
+        so val loss/dice is comparable across epochs rather than noisy per-epoch."""
+        D, H, W = mask_arr.shape
+        pd, ph, pw = self.patch_size
+        pd, ph, pw = min(pd, D), min(ph, H), min(pw, W)
+        max_d, max_h, max_w = D - pd, H - ph, W - pw
+
+        if self.is_train:
+            if np.random.rand() < self.patch_pos_ratio:
+                fg_ids = self._foreground_class_ids()
+                if fg_ids:
+                    coords = np.argwhere(np.isin(mask_arr, fg_ids))
+                    if len(coords) > 0:
+                        cz, cy, cx = coords[np.random.randint(len(coords))]
+                        start_d = int(np.clip(cz - pd // 2, 0, max_d))
+                        start_h = int(np.clip(cy - ph // 2, 0, max_h))
+                        start_w = int(np.clip(cx - pw // 2, 0, max_w))
+                        return start_d, start_h, start_w, pd, ph, pw
+            # negative sample, or this volume has no foreground voxels to center on
+            start_d = np.random.randint(0, max_d + 1) if max_d > 0 else 0
+            start_h = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+            start_w = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+        else:
+            start_d, start_h, start_w = max_d // 2, max_h // 2, max_w // 2
+
+        return start_d, start_h, start_w, pd, ph, pw
 
     def compute_sdf(self, mask, truncation=20, spacing=None):
         dt_out = distance_transform_edt(mask == 0, sampling=spacing)
@@ -112,6 +171,27 @@ class LIDCMasks(torch.utils.data.Dataset):
                 mask_arr[mask_arr == 0.5] = 6
 
             mask_arr = mask_arr.astype(np.int64)
+
+        # === Patch cropping (hardware-forced deviation from full-volume training -- see
+        # decision log) === applied after remap, before SDF/one-hot, so everything downstream
+        # operates on the cropped patch consistently.
+        #
+        # TRAIN ONLY. Validation always stays full-volume (256^3), uncropped -- this is not
+        # an optimization, it's a fidelity requirement: the paper's own authors validate on
+        # complete volumes (their config_vae_masks_train.json trains AND validates at 256^3),
+        # and validation is a forward-pass-only workload (no backward pass, no optimizer
+        # state, no gradient storage), so it does not carry the same VRAM pressure that forced
+        # patch-based TRAINING. Cropping validation too would have been a second, avoidable
+        # deviation stacked on top of the first, and would have made nodule-class val Dice
+        # measure "did this patient's nodule happen to fall inside a fixed center crop" rather
+        # than actual reconstruction quality -- nodules are scattered through the lung, not
+        # centered, so this would silently and systematically penalize/inflate val metrics for
+        # reasons unrelated to the model. is_train is False for split="val" regardless of what
+        # val_patch_size the config or CLI provides, so this check makes that config key inert
+        # for validation, by design.
+        if self.patch_size is not None and self.is_train:
+            start_d, start_h, start_w, pd, ph, pw = self._crop_bounds(mask_arr)
+            mask_arr = mask_arr[start_d:start_d+pd, start_h:start_h+ph, start_w:start_w+pw]
 
         out_dict = {"filename": image_path}
 

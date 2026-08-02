@@ -12,6 +12,7 @@ import warnings
 import wandb
 
 from pathlib import Path
+from datetime import timedelta
 from monai.config import print_config
 from torch.amp import GradScaler, autocast
 from torch.optim import lr_scheduler
@@ -25,7 +26,8 @@ warnings.filterwarnings("ignore")
 # Print Monai configuration
 print_config()
 
-def save_checkpoint(epoch, autoencoder, optimizer, scheduler, scaler, best_val_loss, path):
+def save_checkpoint(epoch, autoencoder, optimizer, scheduler, scaler, best_val_loss,
+                     no_improvement_epochs, cumulative_seconds, path):
     checkpoint = {
         "epoch": epoch,
         "autoencoder_state": autoencoder.state_dict(),
@@ -33,12 +35,65 @@ def save_checkpoint(epoch, autoencoder, optimizer, scheduler, scaler, best_val_l
         "scheduler_state": scheduler.state_dict() if scheduler else None,
         "scaler_state": scaler.state_dict() if scaler else None,
         "best_val_loss": best_val_loss,
+        "no_improvement_epochs": no_improvement_epochs,
+        "cumulative_seconds": cumulative_seconds,
     }
-    torch.save(checkpoint, path)
-    logging.info(f"Checkpoint saved to {path}")
+    # Write to a temp file then atomically replace the real path -- so a crash mid-write
+    # (e.g. power loss, Ctrl+C) can never leave a half-written, unloadable checkpoint behind.
+    tmp_path = path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+    logging.info(f"Checkpoint saved to {path} (epoch {epoch}, cumulative {cumulative_seconds:.0f}s)")
+
+
+def log_epoch_progress(epoch, epoch_start_time, cumulative_seconds, n_epochs):
+    """Update cumulative wall-clock time, estimate time remaining, and read peak VRAM
+    for this epoch. Called once per epoch, right before every checkpoint save, so the
+    numbers in the checkpoint and the numbers printed to the terminal always agree."""
+    epoch_seconds = time.time() - epoch_start_time
+    cumulative_seconds += epoch_seconds
+    avg_epoch_seconds = cumulative_seconds / (epoch + 1)  # epoch is 0-indexed
+    remaining_epochs = max(n_epochs - (epoch + 1), 0)
+    eta_seconds = avg_epoch_seconds * remaining_epochs
+    peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    peak_vram_reserved_gb = torch.cuda.max_memory_reserved() / 1e9 if torch.cuda.is_available() else 0.0
+
+    elapsed_str = str(timedelta(seconds=int(cumulative_seconds)))
+    eta_str = str(timedelta(seconds=int(eta_seconds)))
+
+    logging.info(
+        f"Epoch {epoch} took {epoch_seconds:.1f}s | elapsed {elapsed_str} | "
+        f"ETA {eta_str} | peak VRAM allocated: {peak_vram_gb:.2f} GB | "
+        f"peak VRAM reserved: {peak_vram_reserved_gb:.2f} GB"
+    )
+
+    if torch.cuda.is_available():
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        headroom_pct = 100 * (1 - peak_vram_reserved_gb / total_vram_gb)
+        if headroom_pct < 8:
+            msg = (f"WARNING: peak reserved VRAM ({peak_vram_reserved_gb:.2f} GB) is within "
+                   f"{headroom_pct:.1f}% of this card's total ({total_vram_gb:.2f} GB). "
+                   f"Real OOM risk if anything else touches the GPU during this run.")
+            print(msg)
+            logging.warning(msg)
+
+    return cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb
 
 def load_configurations(args):
-    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+    if args.auto_resume:
+        # Stable, non-timestamped folder -- same command, same folder, every time.
+        # If a checkpoint from a previous (possibly crashed) run already lives there,
+        # pick it up automatically. No need to hunt down and paste a timestamped path.
+        folder_name = args.run_name
+        Path(args.model_dir).mkdir(parents=True, exist_ok=True)
+        sub_folder_dir = os.path.join(args.model_dir, folder_name)
+        candidate_checkpoint = os.path.join(sub_folder_dir, "last_checkpoint.pth")
+        if not args.resume_checkpoint and os.path.exists(candidate_checkpoint):
+            args.resume_checkpoint = candidate_checkpoint
+            print(f"[auto_resume] Found existing checkpoint -- resuming from {candidate_checkpoint}")
+        elif not args.resume_checkpoint:
+            print(f"[auto_resume] No existing checkpoint at {candidate_checkpoint} -- starting fresh in {sub_folder_dir}")
+    elif args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
         sub_folder_dir = os.path.dirname(args.resume_checkpoint)
         folder_name = os.path.basename(sub_folder_dir)
         
@@ -100,6 +155,9 @@ def load_configurations(args):
     return trained_g_path, trained_g_path_best, sub_folder_dir, log_path, tensorboard_writer
 
 def prepare_data(args):
+    patch_size = getattr(args, "patch_size", None)
+    patch_pos_ratio = getattr(args, "patch_pos_ratio", 0.7)
+
     train_dataset = LIDCMasks(
         directory=args.dataset_path,
         mask_mode=args.mask_mode,
@@ -109,7 +167,9 @@ def prepare_data(args):
         seed=args.seed if hasattr(args, "seed") else 42,
         use_onehot=True,  # Changed to False to use single-channel input to use less memory
         sdf_flag=args.sdf_flag,
-        original_textures=args.original_textures
+        original_textures=args.original_textures,
+        patch_size=patch_size,
+        patch_pos_ratio=patch_pos_ratio,
     )
 
     val_dataset = LIDCMasks(
@@ -121,7 +181,14 @@ def prepare_data(args):
         seed=args.seed if hasattr(args, "seed") else 42,
         use_onehot=True,  # Changed to False to use single-channel input to use less memory
         sdf_flag=args.sdf_flag,
-        original_textures=args.original_textures
+        original_textures=args.original_textures,
+        # patch_size/patch_pos_ratio are accepted here for call-site symmetry with
+        # train_dataset, but LIDCMasks.__getitem__ only crops when split=="train" --
+        # validation always sees the full 256^3 volume, uncropped, matching the paper
+        # authors' own validation protocol (fidelity-first: validation is a forward-pass-only
+        # workload, so it doesn't carry the VRAM pressure that forced training-time patching).
+        patch_size=getattr(args, "val_patch_size", None) or patch_size,
+        patch_pos_ratio=patch_pos_ratio,  # unused for val -- no cropping happens for val at all
     )
 
     print(f"Number of training samples: {len(train_dataset)}")
@@ -183,6 +250,7 @@ def main(args):
 
     no_improvement_epochs = 0
     start_epoch = 0
+    cumulative_seconds = 0.0
     if getattr(args, "resume_checkpoint", None):
         if os.path.exists(args.resume_checkpoint):
             logging.info(f"Resuming training from checkpoint {args.resume_checkpoint}")
@@ -195,9 +263,33 @@ def main(args):
                 scaler_g.load_state_dict(checkpoint["scaler_state"])
             best_val_loss = checkpoint["best_val_loss"]
             start_epoch = checkpoint["epoch"] + 1
-            logging.info(f"Resumed from epoch {start_epoch} with best_val_loss={best_val_loss}")
+            # Old checkpoints (saved before this patch) won't have these keys -- default
+            # sensibly rather than crash, but a fresh checkpoint always carries them now.
+            no_improvement_epochs = checkpoint.get("no_improvement_epochs", 0)
+            cumulative_seconds = checkpoint.get("cumulative_seconds", 0.0)
+            logging.info(
+                f"Resumed from epoch {start_epoch} with best_val_loss={best_val_loss}, "
+                f"no_improvement_epochs={no_improvement_epochs}, "
+                f"cumulative_seconds={cumulative_seconds:.0f} "
+                f"({str(timedelta(seconds=int(cumulative_seconds)))} already spent)"
+            )
 
-    for epoch in tqdm(range(start_epoch, args.n_epochs), desc="Training Epochs"):
+    print("Peak VRAM will be reported per-epoch via torch.cuda.max_memory_allocated "
+          "-- exact, not sampled like nvidia-smi.")
+
+    # Guards the final summary below in case start_epoch >= n_epochs already (e.g. re-running
+    # --auto_resume after training already finished) -- the loop body would never execute.
+    elapsed_str = str(timedelta(seconds=int(cumulative_seconds)))
+    if start_epoch >= args.n_epochs:
+        print(f"start_epoch ({start_epoch}) >= n_epochs ({args.n_epochs}) -- "
+              f"training already complete, nothing to do.")
+
+    epoch_bar = tqdm(range(start_epoch, args.n_epochs), desc="Training Epochs",
+                      initial=start_epoch, total=args.n_epochs)
+    for epoch in epoch_bar:
+        epoch_start_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         autoencoder.train()
         train_epoch_loss = 0
         train_recon_loss = 0.0
@@ -343,17 +435,33 @@ def main(args):
                     logging.info(f"No improvement for {no_improvement_epochs} epochs.")
                     if no_improvement_epochs >= args.early_stopping_patience:
                         logging.info(f"Early stopping triggered after {epoch+1} epochs.")
-                        save_checkpoint(epoch, autoencoder, optimizer_g, scheduler_g, scaler_g, best_val_loss, os.path.join(trained_checkpoint, f"last_checkpoint.pth"))
+                        cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
+                            epoch, epoch_start_time, cumulative_seconds, args.n_epochs)
+                        epoch_bar.set_postfix({"elapsed": elapsed_str, "peak_VRAM_reserved_GB": f"{peak_vram_reserved_gb:.2f}"})
+                        save_checkpoint(epoch, autoencoder, optimizer_g, scheduler_g, scaler_g, best_val_loss,
+                                         no_improvement_epochs, cumulative_seconds,
+                                         os.path.join(trained_checkpoint, f"last_checkpoint.pth"))
                         autoencoder.save_pretrained(trained_g_path)
+                        print(f"\nEarly stopping after {epoch+1} epochs. Total training time: {elapsed_str}. "
+                              f"Best val loss: {best_val_loss:.6f}.")
                         tensorboard_writer.close()
                         if args.enable_wandb: wandb.finish()
                         return
-                    
-        save_checkpoint(epoch, autoencoder, optimizer_g, scheduler_g, scaler_g, best_val_loss, os.path.join(trained_checkpoint, f"last_checkpoint.pth"))
+
+        cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
+            epoch, epoch_start_time, cumulative_seconds, args.n_epochs)
+        epoch_bar.set_postfix({"elapsed": elapsed_str, "ETA": eta_str,
+                                "peak_VRAM_alloc_GB": f"{peak_vram_gb:.2f}",
+                                "peak_VRAM_reserved_GB": f"{peak_vram_reserved_gb:.2f}"})
+
+        save_checkpoint(epoch, autoencoder, optimizer_g, scheduler_g, scaler_g, best_val_loss,
+                         no_improvement_epochs, cumulative_seconds,
+                         os.path.join(trained_checkpoint, f"last_checkpoint.pth"))
 
         autoencoder.save_pretrained(trained_g_path)
 
-    logging.info("Training completed!")
+    logging.info(f"Training completed! Total time: {elapsed_str}, best_val_loss={best_val_loss:.6f}")
+    print(f"\nTraining completed! Total wall-clock time: {elapsed_str}. Best val loss: {best_val_loss:.6f}.")
     tensorboard_writer.close()
     if args.enable_wandb: wandb.finish()
 
@@ -381,7 +489,13 @@ if __name__ == "__main__":
     parser.add_argument('--early_stopping_min_delta', type=float, default=0.0,
                         help='Minimum change in val loss to be considered an improvement.')
     parser.add_argument('--resume_checkpoint', type=str, default=None,
-                        help='Path to checkpoint file to resume training from.')
+                        help='Path to checkpoint file to resume training from. '
+                             'Not needed if --auto_resume is set.')
+    parser.add_argument('--auto_resume', action='store_true',
+                        help='Use a stable (non-timestamped) run folder and automatically '
+                             'resume from <model_dir>/<run_name>/last_checkpoint.pth if it '
+                             'exists. Re-running the exact same command after a crash just '
+                             'works -- no path to find or paste.')
     parser.add_argument('--sdf_flag', action='store_true', help="Use SDF regression loss instead of segmentation loss")
     parser.add_argument('--original_textures', action='store_true', help="Use SDF regression loss instead of segmentation loss")
 

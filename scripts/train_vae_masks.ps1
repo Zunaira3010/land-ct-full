@@ -18,10 +18,13 @@
 # Neither of those is a flag here -- both are hardcoded in the shipped code
 # this script calls unmodified, so there's nothing to override.
 #
-# NOTE: unlike vae_train.py (which needed Decision 0015's ChatGPT-authored
-# checkpoint/resume patch), vae_masks_train.py already has native
-# checkpoint/resume support in the official code (--resume_checkpoint).
-# Nothing to port from Decision 0015 for this stage.
+# NOTE: vae_masks_train.py's checkpoint/resume was patched (same category of change as
+# Decision 0015 for vae_train.py -- log as its own decision) to add: atomic checkpoint
+# writes, no_improvement_epochs/cumulative_seconds carried across a resume (not just
+# model/optimizer state), a stable --auto_resume run folder so a crashed run resumes by
+# re-running the identical command, per-epoch elapsed/ETA, and exact peak-VRAM reporting
+# via torch.cuda.max_memory_allocated. The old --resume_checkpoint (manual path) still
+# works too, but --auto_resume is what you want for an unattended 150-epoch run.
 #
 # NOTE: early stopping is on by default (--early_stopping_patience 10,
 # --early_stopping_min_delta 0.0, both official-repo defaults, unchanged
@@ -30,8 +33,11 @@
 # behavior from the shipped code, not a bug, if/when it happens.
 #
 # Usage:
-#   .\scripts\train_vae_masks.ps1                  # full 150-epoch run, resumable via checkpoints\vaeMasks
+#   .\scripts\train_vae_masks.ps1 -AutoResume        # full 150-epoch run, resumable just by
+#                                                     # re-running this same command if it crashes
+#   .\scripts\train_vae_masks.ps1                    # one-shot run, no resume support (old behavior)
 #   .\scripts\train_vae_masks.ps1 -ResumeCheckpoint "checkpoints\vaeMasks\vaeMasksLAND_<timestamp>\last_checkpoint.pth"
+#                                                     # manual resume from a specific old-style checkpoint
 #
 # Runs in the foreground by default -- watch the first few iterations for
 # OOM before walking away (256^3 full-volume batch-1 has NOT been VRAM-
@@ -46,7 +52,8 @@ param(
     [double]$TrainPortion = 0.9,
     [string]$MaskMode = "nodule+lung",
     [int]$NumClasses = 3,
-    [string]$ResumeCheckpoint = $null
+    [string]$ResumeCheckpoint = $null,
+    [switch]$AutoResume
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,6 +89,7 @@ Write-Host "Model config : $ModelConfig"
 Write-Host "Train config : $TrainConfig"
 Write-Host "Checkpoints  : $ModelDir"
 if ($ResumeCheckpoint) { Write-Host "Resuming from: $ResumeCheckpoint" }
+if ($AutoResume) { Write-Host "Auto-resume  : ON -- will pick up checkpoints\vaeMasks\$RunName\last_checkpoint.pth automatically if it exists" }
 
 # Same as the original: disable wandb rather than require a login.
 $env:WANDB_MODE = "disabled"
@@ -105,8 +113,16 @@ $pyArgs = @(
     "--log_path", "$LogPath",
     "--run_name", "$RunName"
 )
+if ($ResumeCheckpoint -and $AutoResume) {
+    Write-Host "ERROR: -ResumeCheckpoint and -AutoResume are mutually exclusive -- pick one." -ForegroundColor Red
+    Write-Host "  -AutoResume alone will find checkpoints\vaeMasks\$RunName\last_checkpoint.pth itself." -ForegroundColor Red
+    exit 1
+}
 if ($ResumeCheckpoint) {
     $pyArgs += @("--resume_checkpoint", "$ResumeCheckpoint")
+}
+if ($AutoResume) {
+    $pyArgs += @("--auto_resume")
 }
 
 python @pyArgs
