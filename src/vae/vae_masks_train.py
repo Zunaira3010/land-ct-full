@@ -23,8 +23,12 @@ from utils.masks_utils import *
 
 warnings.filterwarnings("ignore")
 
-# Print Monai configuration
-print_config()
+# Print Monai configuration -- guarded so this only runs in the parent process, not on
+# every Windows DataLoader worker respawn (each spawn re-imports this module; unguarded,
+# this printed dozens of duplicate banners per epoch -- the actual source of the terminal/
+# log flooding, not tqdm as originally suspected).
+if __name__ == "__main__":
+    print_config()
 
 def save_checkpoint(epoch, autoencoder, optimizer, scheduler, scaler, best_val_loss,
                      no_improvement_epochs, cumulative_seconds, path):
@@ -61,19 +65,27 @@ def log_epoch_progress(epoch, epoch_start_time, cumulative_seconds, n_epochs):
     elapsed_str = str(timedelta(seconds=int(cumulative_seconds)))
     eta_str = str(timedelta(seconds=int(eta_seconds)))
 
+    val_vram_msg = (f"Epoch {epoch} VAL-ONLY peak VRAM -- allocated: {peak_vram_gb:.2f} GB | "
+                     f"reserved: {peak_vram_reserved_gb:.2f} GB")
+    print(val_vram_msg)
+
     logging.info(
         f"Epoch {epoch} took {epoch_seconds:.1f}s | elapsed {elapsed_str} | "
-        f"ETA {eta_str} | peak VRAM allocated: {peak_vram_gb:.2f} GB | "
-        f"peak VRAM reserved: {peak_vram_reserved_gb:.2f} GB"
+        f"ETA {eta_str} | VAL-ONLY peak VRAM allocated: {peak_vram_gb:.2f} GB | "
+        f"VAL-ONLY peak VRAM reserved: {peak_vram_reserved_gb:.2f} GB "
+        f"(isolated from training's peak, which is logged separately above)"
     )
 
     if torch.cuda.is_available():
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         headroom_pct = 100 * (1 - peak_vram_reserved_gb / total_vram_gb)
         if headroom_pct < 8:
-            msg = (f"WARNING: peak reserved VRAM ({peak_vram_reserved_gb:.2f} GB) is within "
-                   f"{headroom_pct:.1f}% of this card's total ({total_vram_gb:.2f} GB). "
-                   f"Real OOM risk if anything else touches the GPU during this run.")
+            msg = (f"WARNING: VALIDATION's peak reserved VRAM ({peak_vram_reserved_gb:.2f} GB) is "
+                   f"within {headroom_pct:.1f}% of this card's total ({total_vram_gb:.2f} GB). "
+                   f"This is the isolated validation-only figure (full 256^3 forward pass), not "
+                   f"training's -- check the 'TRAIN-ONLY peak VRAM' line logged earlier this epoch "
+                   f"if you need that number too. Real OOM risk if anything else touches the GPU "
+                   f"during this run.")
             print(msg)
             logging.warning(msg)
 
@@ -195,10 +207,12 @@ def prepare_data(args):
     print(f"Number of validation samples: {len(val_dataset)}")
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8,
+        persistent_workers=True,
     )
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.val_batch_size, shuffle=False, num_workers=8
+        val_dataset, batch_size=args.val_batch_size, shuffle=False, num_workers=8,
+        persistent_workers=True,
     )
 
     return train_dataloader, val_dataloader
@@ -352,6 +366,18 @@ def main(args):
 
         scheduler_g.step()
 
+        # Capture training's own isolated peak VRAM before the validation block resets the
+        # counter -- otherwise this number is lost and we can no longer tell training's real
+        # peak apart from validation's, defeating the point of separating the two resets.
+        if torch.cuda.is_available():
+            train_peak_vram_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
+            train_peak_vram_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+            train_vram_msg = (f"Epoch {epoch} TRAIN-ONLY peak VRAM -- allocated: "
+                               f"{train_peak_vram_alloc_gb:.2f} GB | reserved: "
+                               f"{train_peak_vram_reserved_gb:.2f} GB")
+            print(train_vram_msg)
+            logging.info(train_vram_msg)
+
         # Log train visuals once per epoch
         if epoch % args.log_images_interval == 0 and not args.sdf_flag:
             print("Logging train reconstructions to tensorboard...")
@@ -368,6 +394,13 @@ def main(args):
         if epoch % args.val_interval == 0:
             print("Validation...")
             autoencoder.eval()
+            # Isolate validation's own peak VRAM from training's -- the reset at the top of
+            # this epoch (line ~292) covers train+val combined, which can't distinguish
+            # "validation genuinely needs this much" from "this is training's fragmentation
+            # still sitting in the allocator when validation ran." Reset again right here so
+            # the post-validation peak_vram figures reflect validation alone.
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             val_epoch_loss = 0
             val_recon_loss = 0.0
             val_kl_loss = 0.0
