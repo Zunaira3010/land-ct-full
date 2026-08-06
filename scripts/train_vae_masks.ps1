@@ -33,11 +33,18 @@
 # behavior from the shipped code, not a bug, if/when it happens.
 #
 # Usage:
-#   .\scripts\train_vae_masks.ps1 -AutoResume        # full 150-epoch run, resumable just by
-#                                                     # re-running this same command if it crashes
-#   .\scripts\train_vae_masks.ps1                    # one-shot run, no resume support (old behavior)
+#   .\scripts\train_vae_masks.ps1                    # full 150-epoch run, auto-resume ON by
+#                                                     # default -- just re-run this same command
+#                                                     # if it crashes or gets interrupted
+#   .\scripts\train_vae_masks.ps1 -AutoResume:$false  # one-shot run, no resume support (old behavior)
 #   .\scripts\train_vae_masks.ps1 -ResumeCheckpoint "checkpoints\vaeMasks\vaeMasksLAND_<timestamp>\last_checkpoint.pth"
 #                                                     # manual resume from a specific old-style checkpoint
+#                                                     # (auto-resume is automatically stood down for this)
+#
+# PAUSE ON DEMAND (e.g. someone else needs the PC): run scripts\pause_training.ps1
+# in a second terminal while this is running. It stops cleanly after finishing
+# whichever epoch is currently in progress (checkpoint already safely saved --
+# nothing lost). To resume, just run this exact same command again.
 #
 # Runs in the foreground by default -- watch the first few iterations for
 # OOM before walking away (256^3 full-volume batch-1 has NOT been VRAM-
@@ -53,7 +60,7 @@ param(
     [string]$MaskMode = "nodule+lung",
     [int]$NumClasses = 3,
     [string]$ResumeCheckpoint = $null,
-    [switch]$AutoResume
+    [switch]$AutoResume = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,7 +96,11 @@ Write-Host "Model config : $ModelConfig"
 Write-Host "Train config : $TrainConfig"
 Write-Host "Checkpoints  : $ModelDir"
 if ($ResumeCheckpoint) { Write-Host "Resuming from: $ResumeCheckpoint" }
-if ($AutoResume) { Write-Host "Auto-resume  : ON -- will pick up checkpoints\vaeMasks\$RunName\last_checkpoint.pth automatically if it exists" }
+if ($AutoResume) {
+    Write-Host "Auto-resume  : ON (default) -- will pick up checkpoints\vaeMasks\$RunName\last_checkpoint.pth automatically if it exists"
+} else {
+    Write-Host "Auto-resume  : OFF -- a crash will require a manual -ResumeCheckpoint next time" -ForegroundColor Yellow
+}
 
 # Same as the original: disable wandb rather than require a login.
 $env:WANDB_MODE = "disabled"
@@ -113,9 +124,14 @@ $pyArgs = @(
     "--log_path", "$LogPath",
     "--run_name", "$RunName"
 )
+if ($ResumeCheckpoint -and -not $PSBoundParameters.ContainsKey('AutoResume')) {
+    # User gave an explicit manual resume path and never touched -AutoResume --
+    # respect that intent rather than colliding with AutoResume's new default-true.
+    $AutoResume = $false
+}
 if ($ResumeCheckpoint -and $AutoResume) {
     Write-Host "ERROR: -ResumeCheckpoint and -AutoResume are mutually exclusive -- pick one." -ForegroundColor Red
-    Write-Host "  -AutoResume alone will find checkpoints\vaeMasks\$RunName\last_checkpoint.pth itself." -ForegroundColor Red
+    Write-Host "  -AutoResume alone (the default) will find checkpoints\vaeMasks\$RunName\last_checkpoint.pth itself." -ForegroundColor Red
     exit 1
 }
 if ($ResumeCheckpoint) {

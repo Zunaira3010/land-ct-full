@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 import torch
 import logging
@@ -12,7 +13,7 @@ import warnings
 import wandb
 
 from pathlib import Path
-from datetime import timedelta
+from datetime import timedelta, datetime
 from monai.config import print_config
 from torch.amp import GradScaler, autocast
 from torch.optim import lr_scheduler
@@ -29,6 +30,22 @@ warnings.filterwarnings("ignore")
 # log flooding, not tqdm as originally suspected).
 if __name__ == "__main__":
     print_config()
+
+def check_pause_requested(checkpoint_dir):
+    """Looks for a PAUSE_REQUESTED sentinel file in the run's checkpoint folder. If found,
+    consumes it (deletes it) and returns True, so a stale flag can't re-trigger a pause on
+    the next --auto_resume launch. Checked only at epoch boundaries, right after that
+    epoch's checkpoint is safely on disk -- so a pause can never lose a completed epoch,
+    only delay by however long the epoch already in progress takes to finish."""
+    flag_path = os.path.join(checkpoint_dir, "PAUSE_REQUESTED")
+    if os.path.exists(flag_path):
+        try:
+            os.remove(flag_path)
+        except OSError:
+            pass
+        return True
+    return False
+
 
 def save_checkpoint(epoch, autoencoder, optimizer, scheduler, scaler, best_val_loss,
                      no_improvement_epochs, cumulative_seconds, path):
@@ -59,11 +76,14 @@ def log_epoch_progress(epoch, epoch_start_time, cumulative_seconds, n_epochs):
     avg_epoch_seconds = cumulative_seconds / (epoch + 1)  # epoch is 0-indexed
     remaining_epochs = max(n_epochs - (epoch + 1), 0)
     eta_seconds = avg_epoch_seconds * remaining_epochs
+    eta_days = eta_seconds / 86400.0
+    eta_finish_str = (datetime.now() + timedelta(seconds=eta_seconds)).strftime("%a %b %d, %H:%M")
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
     peak_vram_reserved_gb = torch.cuda.max_memory_reserved() / 1e9 if torch.cuda.is_available() else 0.0
 
     elapsed_str = str(timedelta(seconds=int(cumulative_seconds)))
     eta_str = str(timedelta(seconds=int(eta_seconds)))
+    eta_days_str = f"{eta_days:.1f} days"
 
     val_vram_msg = (f"Epoch {epoch} VAL-ONLY peak VRAM -- allocated: {peak_vram_gb:.2f} GB | "
                      f"reserved: {peak_vram_reserved_gb:.2f} GB")
@@ -71,7 +91,8 @@ def log_epoch_progress(epoch, epoch_start_time, cumulative_seconds, n_epochs):
 
     logging.info(
         f"Epoch {epoch} took {epoch_seconds:.1f}s | elapsed {elapsed_str} | "
-        f"ETA {eta_str} | VAL-ONLY peak VRAM allocated: {peak_vram_gb:.2f} GB | "
+        f"ETA {eta_str} ({eta_days_str}, est. finish {eta_finish_str}) | "
+        f"VAL-ONLY peak VRAM allocated: {peak_vram_gb:.2f} GB | "
         f"VAL-ONLY peak VRAM reserved: {peak_vram_reserved_gb:.2f} GB "
         f"(isolated from training's peak, which is logged separately above)"
     )
@@ -89,7 +110,7 @@ def log_epoch_progress(epoch, epoch_start_time, cumulative_seconds, n_epochs):
             print(msg)
             logging.warning(msg)
 
-    return cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb
+    return cumulative_seconds, elapsed_str, eta_str, eta_days_str, eta_finish_str, peak_vram_gb, peak_vram_reserved_gb
 
 def load_configurations(args):
     if args.auto_resume:
@@ -468,7 +489,7 @@ def main(args):
                     logging.info(f"No improvement for {no_improvement_epochs} epochs.")
                     if no_improvement_epochs >= args.early_stopping_patience:
                         logging.info(f"Early stopping triggered after {epoch+1} epochs.")
-                        cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
+                        cumulative_seconds, elapsed_str, eta_str, eta_days_str, eta_finish_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
                             epoch, epoch_start_time, cumulative_seconds, args.n_epochs)
                         epoch_bar.set_postfix({"elapsed": elapsed_str, "peak_VRAM_reserved_GB": f"{peak_vram_reserved_gb:.2f}"})
                         save_checkpoint(epoch, autoencoder, optimizer_g, scheduler_g, scaler_g, best_val_loss,
@@ -481,9 +502,10 @@ def main(args):
                         if args.enable_wandb: wandb.finish()
                         return
 
-        cumulative_seconds, elapsed_str, eta_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
+        cumulative_seconds, elapsed_str, eta_str, eta_days_str, eta_finish_str, peak_vram_gb, peak_vram_reserved_gb = log_epoch_progress(
             epoch, epoch_start_time, cumulative_seconds, args.n_epochs)
-        epoch_bar.set_postfix({"elapsed": elapsed_str, "ETA": eta_str,
+        epoch_bar.set_postfix({"elapsed": elapsed_str, "ETA": f"{eta_str} ({eta_days_str})",
+                                "finish_est": eta_finish_str,
                                 "peak_VRAM_alloc_GB": f"{peak_vram_gb:.2f}",
                                 "peak_VRAM_reserved_GB": f"{peak_vram_reserved_gb:.2f}"})
 
@@ -492,6 +514,16 @@ def main(args):
                          os.path.join(trained_checkpoint, f"last_checkpoint.pth"))
 
         autoencoder.save_pretrained(trained_g_path)
+
+        if check_pause_requested(trained_checkpoint):
+            print(f"\nPause requested -- stopping cleanly after epoch {epoch+1}/{args.n_epochs} "
+                  f"(checkpoint already saved, nothing lost). Resume anytime by re-running the "
+                  f"exact same command -- auto-resume will pick up from epoch {epoch+2} "
+                  f"automatically.")
+            logging.info(f"Pause requested by user after epoch {epoch}. Checkpoint saved. Exiting cleanly.")
+            tensorboard_writer.close()
+            if args.enable_wandb: wandb.finish()
+            return
 
     logging.info(f"Training completed! Total time: {elapsed_str}, best_val_loss={best_val_loss:.6f}")
     print(f"\nTraining completed! Total wall-clock time: {elapsed_str}. Best val loss: {best_val_loss:.6f}.")
@@ -533,4 +565,14 @@ if __name__ == "__main__":
     parser.add_argument('--original_textures', action='store_true', help="Use SDF regression loss instead of segmentation loss")
 
     args = parser.parse_args()
-    main(args)
+    try:
+        main(args)
+    except KeyboardInterrupt:
+        print("\n\nCtrl+C received -- stopping now. This is safe: the most recent completed "
+              "epoch's checkpoint is already saved on disk (checkpoint writes are atomic, so "
+              "it can't be corrupted). Only the epoch that was in progress when you interrupted "
+              "is lost, nothing before it. Resume anytime by re-running the exact same command "
+              "-- with --auto_resume, it picks up automatically. For a cleaner stop that doesn't "
+              "lose the in-progress epoch, use scripts\\pause_training.ps1 next time and let the "
+              "current epoch finish first.")
+        sys.exit(130)
